@@ -1,0 +1,11 @@
+config mac-shaper 'general'
+	option device 'br-lan'
+	option default_bw '1000mbit'
+	option burst 'auto'
+	option cburst 'auto'
+
+config rule
+	option mac 'AA:BB:CC:DD:EE:FF'
+	option rate '200mbit'
+	option comment 'Laptop'
+	option enabled '0'

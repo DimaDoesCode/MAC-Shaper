@@ -1,0 +1,35 @@
+#!/bin/sh
+
+# rpcd plugin: supports "list" and "call <method>" interface
+# When rpcd asks for "list" we print available methods and their signatures.
+# When rpcd executes "call <method>" we read stdin (JSON args) and print JSON reply.
+
+case "$1" in
+  list)
+    # advertise one method "status" with no parameters
+    echo '{ "status": {} }'
+    ;;
+
+  call)
+    case "$2" in
+      status)
+        # No input expected; just check tc qdisc for br-lan
+        if tc qdisc show dev br-lan 2>/dev/null | grep -q "qdisc htb"; then
+          echo '{ "active": 1 }'
+        else
+          echo '{ "active": 0 }'
+        fi
+        ;;
+      *)
+        # unknown method -> empty object
+        echo '{}'
+        ;;
+    esac
+    ;;
+
+  *)
+    # default: behave like list
+    echo '{ "status": {} }'
+    ;;
+esac
+

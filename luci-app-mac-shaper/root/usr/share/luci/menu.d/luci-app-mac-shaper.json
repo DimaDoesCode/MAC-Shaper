@@ -1,0 +1,15 @@
+{
+    "admin/services/mac_shaper": {
+        "title": "MAC Shaper",
+        "order": 61,
+        "action": {
+            "type": "view",
+            "path": "mac_shaper"
+        },
+        "depends": {
+            "acl": [ "luci-app-mac-shaper" ],
+            "uci": { "mac-shaper": true }
+        }
+    }
+}
+

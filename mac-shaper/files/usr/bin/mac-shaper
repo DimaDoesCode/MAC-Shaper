@@ -1,0 +1,227 @@
+#!/bin/sh
+# /usr/bin/mac-shaper v3.0 FINAL
+# MAC-based traffic shaper (fixed br-lan device)
+# Uses UCI config: /etc/config/mac-shaper
+# Clean & deterministic architecture
+
+UCI_CFG="mac-shaper"
+DEV="br-lan"
+
+TC=$(which tc 2>/dev/null || echo /sbin/tc)
+
+LOG_TARGET="SYSLOG"
+LOG_FILE="/var/log/mac-shaper.log"
+
+# --------------------------------------------------
+# LOGGING
+# --------------------------------------------------
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+
+    if [ "$LOG_TARGET" = "SYSLOG" ]; then
+        logger -t "mac-shaper" -p "user.$level" "$message"
+    else
+        echo "$(date +'%F %T') [$level] [mac-shaper] $message" >> "$LOG_FILE"
+    fi
+}
+
+# --------------------------------------------------
+# CONFIG READERS
+# --------------------------------------------------
+get_default_bw() {
+    uci -q get "$UCI_CFG".general.default_bw 2>/dev/null || echo "100mbit"
+}
+
+get_burst() {
+    uci -q get "$UCI_CFG".general.burst 2>/dev/null || echo "auto"
+}
+
+get_cburst() {
+    uci -q get "$UCI_CFG".general.cburst 2>/dev/null || echo "auto"
+}
+
+BW_DEFAULT=$(get_default_bw)
+BURST=$(get_burst)
+CBURST=$(get_cburst)
+
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
+run_tc() {
+    $TC "$@" 2>/dev/null
+}
+
+validate_mac() {
+    echo "$1" | grep -Eiq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'
+}
+
+# --------------------------------------------------
+# MAC FILTER BUILDER
+# --------------------------------------------------
+add_mac_filter() {
+    local mac="$1"
+    local flow="$2"
+
+    local M0 M1 M2
+    M0=$(echo "$mac" | cut -d: -f1,2 | tr -d :)
+    M1=$(echo "$mac" | cut -d: -f3,4 | tr -d :)
+    M2=$(echo "$mac" | cut -d: -f5,6 | tr -d :)
+
+    run_tc filter add dev "$DEV" parent 1: protocol ip prio 5 u32 \
+        match u16 0x0800 0xFFFF at -2 \
+        match u16 0x${M2} 0xFFFF at -4 \
+        match u32 0x${M0}${M1} 0xFFFFFFFF at -8 \
+        flowid "$flow"
+
+    run_tc filter add dev "$DEV" parent 1: protocol ip prio 5 u32 \
+        match u16 0x0800 0xFFFF at -2 \
+        match u32 0x${M1}${M2} 0xFFFFFFFF at -12 \
+        match u16 0x${M0} 0xFFFF at -14 \
+        flowid "$flow"
+}
+
+# --------------------------------------------------
+# UCI RULE LIST
+# --------------------------------------------------
+build_list() {
+    uci show "$UCI_CFG" 2>/dev/null | \
+        awk -F'[.=]' '/@rule\[/ {print $2}' | \
+        sort -u | while read -r s; do
+
+            local enabled mac rate
+
+            enabled=$(uci -q get "$UCI_CFG"."$s".enabled)
+            mac=$(uci -q get "$UCI_CFG"."$s".mac)
+            rate=$(uci -q get "$UCI_CFG"."$s".rate)
+
+            [ "$enabled" = "0" ] && continue
+
+            [ -n "$mac" ] && [ -n "$rate" ] && echo "$mac $rate"
+        done
+}
+
+# --------------------------------------------------
+# QDISC CORE
+# --------------------------------------------------
+reset_qdisc() {
+    log info "delete qdisc on $DEV"
+    run_tc qdisc del dev "$DEV" root || true
+}
+
+setup_htb() {
+    log info "setup HTB default $BW_DEFAULT on $DEV"
+
+    run_tc qdisc add dev "$DEV" root handle 1: htb default 10
+
+    run_tc class add dev "$DEV" parent 1: \
+        classid 1:1 htb rate "$BW_DEFAULT" ceil "$BW_DEFAULT" \
+        burst "$BURST" cburst "$CBURST"
+
+    run_tc class add dev "$DEV" parent 1:1 \
+        classid 1:10 htb rate "$BW_DEFAULT" ceil "$BW_DEFAULT" \
+        burst "$BURST" cburst "$CBURST"
+}
+
+start() {
+    log info "START on $DEV"
+
+    reset_qdisc
+    modprobe sch_htb 2>/dev/null || true
+    setup_htb
+
+    local i=20
+
+    local tc_burst=""
+    local tc_cburst=""
+
+    if [[ -n "$BURST" && "$BURST" != "auto" ]]; then
+        tc_burst="burst $BURST"
+    fi
+    
+    if [[ -n "$CBURST" && "$CBURST" != "auto" ]]; then
+        tc_cburst="cburst $CBURST"
+    fi
+
+    build_list | while read -r mac rate; do
+
+        if ! validate_mac "$mac"; then
+            log warning "invalid MAC skipped: $mac"
+            continue
+        fi
+
+        local cid="1:$i"
+
+        log info "add $mac => $rate"
+
+        run_tc class add dev "$DEV" parent 1:1 \
+            classid "$cid" \
+            htb rate "$rate" ceil "$rate" \
+            $tc_burst $tc_cburst
+
+        add_mac_filter "$mac" "$cid"
+
+        i=$((i+1))
+    done
+
+    run_tc filter add dev "$DEV" parent 1: protocol ip prio 5 \
+        u32 match u16 0x0800 0xFFFF at -2 flowid 1:10
+
+}
+
+reload() {
+    log info "RELOAD on $DEV"
+    stop
+    sleep 1
+    start
+}
+
+stop() {
+    log info "STOP on $DEV"
+    reset_qdisc
+}
+
+restart() {
+    log info "RESTART on $DEV"
+    stop
+    sleep 1
+    start
+}
+
+status() {
+
+    if $TC qdisc show dev "$DEV" 2>/dev/null | grep -q htb ; then
+        active=1
+    else
+        active=0
+    fi
+
+    rules=$(build_list | wc -l)
+
+    cat <<EOF
+{
+    "active": $active,
+    "device": "$DEV",
+    "rules": $rules,
+    "default_bw": "$BW_DEFAULT"
+    "burst": "$BURST"
+    "cburst": "$CBURST"
+}
+EOF
+}
+
+# --------------------------------------------------
+# ENTRYPOINT
+# --------------------------------------------------
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) restart ;;
+    reload)  reload ;;
+    status)  status ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|reload|status}"
+        exit 1
+    ;;
+esac

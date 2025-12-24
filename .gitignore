@@ -1,0 +1,16 @@
+
+# Compiled OpenWrt packages and archives
+*.ipk
+*.tar.gz
+
+# Windows system temporary files
+Thumbs.db
+Desktop.ini
+
+# IDE and text editor settings
+.vscode/
+.idea/
+
+# Private keys and local secrets
+*.key
+*.priv

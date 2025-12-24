@@ -1,0 +1,15 @@
+{
+  "luci-app-mac-shaper": {
+    "description": "Permissions for MAC Shaper UI to read status",
+    "read": {
+      "ubus": {
+        "luci.mac-shaper": ["status"]
+      },
+      "uci": ["mac-shaper"]
+    },
+    "write": {
+      "luci": ["setInitAction"],
+      "uci": ["mac-shaper"]
+    }
+  }
+}

@@ -1,0 +1,644 @@
+name: Build OpenWrt packages
+
+on:
+  push:
+    branches: [ main, master ]
+    # Build only if source code or build logic changes
+    paths:
+      - 'mac-shaper/**'
+      - 'luci-app-mac-shaper/**'
+#      - '.github/workflows/build.yml'
+
+  pull_request:
+    branches: [ main, master ]
+    # Verify changes only if they affect the code
+    paths:
+      - 'mac-shaper/**'
+      - 'luci-app-mac-shaper/**'
+#      - '.github/workflows/build.yml'
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# Prevent concurrent deployments and cancel in-progress runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+env:
+  OPENWRT_VERSION: "24.10.4"
+  MAJOR_VERSION: "1"
+  MINOR_VERSION: "0"
+  PATCH_VERSION: "0"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: ipq806x-generic
+            sdk_url: https://downloads.openwrt.org/releases/24.10.4/targets/ipq806x/generic/openwrt-sdk-24.10.4-ipq806x-generic_gcc-13.3.0_musl_eabi.Linux-x86_64.tar.zst
+          - name: mvebu-cortexa9
+            sdk_url: https://downloads.openwrt.org/releases/24.10.4/targets/mvebu/cortexa9/openwrt-sdk-24.10.4-mvebu-cortexa9_gcc-13.3.0_musl_eabi.Linux-x86_64.tar.zst
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            flex \
+            bison \
+            g++ \
+            gawk \
+            gcc-multilib \
+            gettext \
+            git \
+            libncurses-dev \
+            libssl-dev \
+            python3 \
+            rsync \
+            unzip \
+            zlib1g-dev \
+            file \
+            wget \
+            zstd \
+            tree \
+            bzip2 \
+            coreutils
+
+      - name: Cache OpenWrt SDK
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: openwrt-sdk
+          key: openwrt-sdk-${{ matrix.target.name }}-${{ env.OPENWRT_VERSION }}-v1
+          restore-keys: |
+            openwrt-sdk-${{ matrix.target.name }}-${{ env.OPENWRT_VERSION }}-
+
+      - name: Download and extract OpenWrt SDK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+
+          echo "Downloading SDK for ${{ matrix.target.name }}"
+          wget -O sdk.tar.zst "${{ matrix.target.sdk_url }}"
+
+          tar -I zstd -xf sdk.tar.zst
+
+          SDK_DIR="$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n1)"
+          [ -d "$SDK_DIR" ] || { echo "SDK directory not found"; exit 1; }
+
+          mv "$SDK_DIR" openwrt-sdk
+          rm -f sdk.tar.zst
+
+      - name: Update feeds first (to create feed structure)
+        working-directory: openwrt-sdk
+        run: |
+          set -euxo pipefail
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Copy packages and update PKG_RELEASE
+        run: |
+          set -euxo pipefail
+          
+          # Define the static version and dynamic release
+          FULL_VERSION="${{ env.MAJOR_VERSION }}.${{ env.MINOR_VERSION }}.${{ env.PATCH_VERSION }}"
+          BUILD_RELEASE="${{ github.run_number }}"
+          
+          echo "Package version: $FULL_VERSION"
+          echo "Build release: $BUILD_RELEASE"
+          
+          # Copy mac-shaper to openwrt-sdk/feeds/packages/net
+          cp -r mac-shaper openwrt-sdk/feeds/packages/net
+          
+          # Copy luci-app-mac-shaper to luci feed applications
+          cp -r luci-app-mac-shaper openwrt-sdk/feeds/luci/applications
+          
+          # Update mac-shaper PKG_VERSION to match env variables and PKG_RELEASE to build number
+          if [ -f openwrt-sdk/feeds/packages/net/mac-shaper/Makefile ]; then
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$FULL_VERSION/" openwrt-sdk/feeds/packages/net/mac-shaper/Makefile
+            sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=$BUILD_RELEASE/" openwrt-sdk/feeds/packages/net/mac-shaper/Makefile
+            echo "✅ Updated mac-shaper: version=$FULL_VERSION, release=$BUILD_RELEASE"
+            grep -E "PKG_VERSION|PKG_RELEASE" openwrt-sdk/feeds/packages/net/mac-shaper/Makefile
+          fi
+
+          # Update luci-app-mac-shaper PKG_VERSION to match env variables and PKG_RELEASE to build number
+          if [ -f openwrt-sdk/feeds/luci/applications/luci-app-mac-shaper/Makefile ]; then
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$FULL_VERSION/" openwrt-sdk/feeds/luci/applications/luci-app-mac-shaper/Makefile
+            sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=$BUILD_RELEASE/" openwrt-sdk/feeds/luci/applications/luci-app-mac-shaper/Makefile
+            echo "✅ Updated luci-app-mac-shaper: version=$FULL_VERSION, release=$BUILD_RELEASE"
+            grep -E "PKG_VERSION|PKG_RELEASE" openwrt-sdk/feeds/luci/applications/luci-app-mac-shaper/Makefile
+          fi
+
+          echo "=== Package structure ==="
+          echo "mac-shaper location:"
+          tree -L 2 openwrt-sdk/feeds/packages/net || ls -la openwrt-sdk/feeds/packages/net
+          echo ""
+          echo "luci-app-mac-shaper location:"
+          tree -L 2 openwrt-sdk/feeds/luci/applications || ls -la openwrt-sdk/feeds/luci/applications
+
+      - name: Rescan packages after adding to feeds
+        working-directory: openwrt-sdk
+        run: |
+          set -euxo pipefail
+          
+          echo "=== Rescanning packages ==="
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+
+      - name: Verify packages are recognized
+        working-directory: openwrt-sdk
+        run: |
+          echo "=== Checking if packages are in build system ==="
+          grep -r "mac-shaper" tmp/.packageinfo 2>/dev/null || echo "Not found in packageinfo"
+          grep -r "mac-shaper" .config 2>/dev/null || echo "Not found in config"
+          
+      - name: Configure and build packages
+        working-directory: openwrt-sdk
+        run: |
+          set -euxo pipefail
+          
+          echo "=== Building mac-shaper ==="
+          make package/feeds/packages/mac-shaper/compile -j$(nproc) V=s
+          
+          echo "=== Building luci-app-mac-shaper ==="
+          make package/feeds/luci/luci-app-mac-shaper/compile -j$(nproc) V=s
+
+      - name: Verify build success
+        working-directory: openwrt-sdk
+        run: |
+          if ! find bin/packages -name "*mac-shaper*.ipk" -type f | grep -q .; then
+            echo "❌ Error: No packages were built!"
+            exit 1
+          fi
+          echo "✅ Build successful, packages found:"
+          find bin/packages -name "*mac-shaper*.ipk" -type f -ls
+
+      - name: List built packages
+        if: always()
+        working-directory: openwrt-sdk
+        run: |
+          echo "=== Built packages ==="
+          find bin/packages -name "*mac-shaper*.ipk" -type f -ls || echo "No packages built"
+
+      - name: Upload IPK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.target.name }}-${{ github.run_number }}
+          path: openwrt-sdk/bin/packages/*/*/*mac-shaper*.ipk
+          if-no-files-found: error
+
+      - name: Prepare files for release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        run: |
+          set -euxo pipefail
+          mkdir -p release_files
+          
+          # Copy all found .ipk files to an external folder
+          find openwrt-sdk/bin/packages -name "*mac-shaper*.ipk" -type f -exec cp {} release_files/ \;
+          
+          # Rename files for target clarity
+          cd release_files
+          for f in *.ipk; do 
+            [ -f "$f" ] || continue
+            mv "$f" "${{ matrix.target.name }}-$f"
+          done
+          
+          echo "=== Release files prepared ==="
+          ls -lh
+
+      - name: Upload release artifacts
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target.name }}
+          path: release_files/*.ipk
+          retention-days: 1
+
+      - name: Prepare OPKG Feed
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        run: |
+          set -euxo pipefail
+          
+          # Define the feed directory for the current target
+          FEED_DIR="gh-pages/${{ matrix.target.name }}"
+          mkdir -p "$FEED_DIR"
+          
+          # Copy only relevant packages to keep the feed clean
+          find openwrt-sdk/bin/packages -name "*mac-shaper*.ipk" -exec cp {} "$FEED_DIR/" \;
+          
+          cd "$FEED_DIR"
+          
+          # Clear existing Packages file if any
+          > Packages
+          
+          # Generate the index by extracting control files from each IPK
+          for pkg in *.ipk; do
+            [ -f "$pkg" ] || continue
+            echo "Indexing $pkg..."
+            
+            # Verify package structure before extraction
+            if ! tar -tzf "$pkg" ./control.tar.gz >/dev/null 2>&1; then
+              echo "⚠️  Warning: $pkg missing control.tar.gz, skipping"
+              continue
+            fi
+            
+            # Extract control file with error handling
+            if ! tar -zxOf "$pkg" ./control.tar.gz | tar -zxOf - ./control >> Packages; then
+              echo "⚠️  Warning: Failed to extract control from $pkg, skipping"
+              continue
+            fi
+            
+            # Append mandatory fields for OPKG: Filename, Size, and SHA256sum
+            echo "Filename: $pkg" >> Packages
+            echo "Size: $(stat -L -c%s "$pkg")" >> Packages
+            echo "SHA256sum: $(sha256sum "$pkg" | cut -d' ' -f1)" >> Packages
+            
+            # Add an empty line as a separator between package records
+            echo "" >> Packages
+          done
+          
+          # Sanity check: ensure the Packages index is not empty
+          if [ ! -s Packages ]; then 
+            echo "❌ Error: Failed to generate Packages index"
+            exit 1
+          fi
+          
+          # Compress the index as required by OpenWrt
+          gzip -9ck Packages > Packages.gz
+          
+          echo "✅ Successfully generated feed for ${{ matrix.target.name }}"
+          echo "📦 Feed contents:"
+          wc -l Packages
+          cd ../..
+
+      - name: Upload intermediate feed
+        uses: actions/upload-artifact@v4
+        with:
+          name: feed-${{ matrix.target.name }}
+          path: gh-pages/${{ matrix.target.name }}/
+          retention-days: 1
+
+  # Create GitHub Release with all packages
+  create-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-releases
+          pattern: release-*
+          merge-multiple: false
+
+      - name: Consolidate release files
+        run: |
+          set -euxo pipefail
+          
+          mkdir -p final-release
+          
+          # Copy all .ipk files from all architectures into one folder
+          find all-releases -name "*.ipk" -type f -exec cp {} final-release/ \;
+          
+          echo "=== Release contents ==="
+          ls -lh final-release/
+          
+          file_count=$(find final-release -name "*.ipk" | wc -l)
+          echo "Total files: $file_count"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.MAJOR_VERSION }}.${{ env.MINOR_VERSION }}.${{ env.PATCH_VERSION }}-${{ github.run_number }}
+          name: Release v${{ env.MAJOR_VERSION }}.${{ env.MINOR_VERSION }}.${{ env.PATCH_VERSION }}-${{ github.run_number }}
+          files: final-release/*.ipk
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## 📦 OpenWrt Packages - v${{ env.MAJOR_VERSION }}.${{ env.MINOR_VERSION }}.${{ env.PATCH_VERSION }}-${{ github.run_number }}
+            
+            Built for multiple architectures. Download the package for your router's architecture.
+            
+            ### 📋 Version Information
+            - **Package Version:** ${{ env.MAJOR_VERSION }}.${{ env.MINOR_VERSION }}.${{ env.PATCH_VERSION }}
+            - **Build Release:** ${{ github.run_number }}
+            
+            ### 🏗️ Supported Architectures
+            - ipq806x-generic (ARM Cortex-A15)
+            - mvebu-cortexa9 (ARM Cortex-A9)
+            
+            ### 📥 Installation
+            ```bash
+            # Download the appropriate .ipk file for your architecture
+            # Transfer to your router and install:
+            opkg install <package-name>.ipk
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Prepare GitHub Pages feed
+  prepare-pages:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+      - name: Download all architecture feeds
+        uses: actions/download-artifact@v4
+        with:
+          path: all-feeds
+          pattern: feed-*
+          merge-multiple: false
+
+      - name: Consolidate directory structure
+        run: |
+          set -euxo pipefail
+          
+          # Create the final directory for GitHub Pages
+          mkdir -p final-pages
+          
+          # Move into the folder where artifacts were downloaded
+          cd all-feeds
+          
+          # Iterate over each downloaded artifact folder
+          for dir in feed-*; do
+            [ -d "$dir" ] || continue
+            
+            # Extract the target name from the folder name (e.g., 'ipq806x-generic')
+            target_name=${dir#feed-}
+            
+            # Create a dedicated subdirectory for this target in the final repo
+            mkdir -p "../final-pages/$target_name"
+            
+            # Copy all files (IPKs and Indexes) into the target-specific folder
+            cp -r "$dir"/* "../final-pages/$target_name/" 2>/dev/null || echo "No files in $dir"
+          done
+          
+          cd ..
+          
+          echo "=== Final repository structure ==="
+          tree final-pages || ls -R final-pages
+          
+          echo "=== Feed statistics ==="
+          for target_dir in final-pages/*/; do
+            target=$(basename "$target_dir")
+            pkg_count=$(find "$target_dir" -name "*.ipk" -type f | wc -l)
+            echo "  $target: $pkg_count packages"
+          done
+
+      - name: Create index pages
+        run: |
+          set -euxo pipefail
+          
+          # Extract repository name from full path (owner/repo -> repo)
+          REPO_NAME="${{ github.repository }}"
+          REPO_NAME="${REPO_NAME#*/}"
+          FEED_BASE_URL="https://${{ github.repository_owner }}.github.io/${REPO_NAME}"
+          
+          echo "Feed base URL: $FEED_BASE_URL"
+          
+          # Create main index.html
+          cat > final-pages/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>OpenWrt Package Feed</title>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+              body { 
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+                max-width: 900px; 
+                margin: 50px auto; 
+                padding: 20px;
+                line-height: 1.6;
+                color: #333;
+              }
+              h1 { color: #0066cc; border-bottom: 3px solid #0066cc; padding-bottom: 10px; }
+              h2 { color: #444; margin-top: 30px; }
+              h3 { color: #0066cc; }
+              .target { 
+                margin: 20px 0; 
+                padding: 20px; 
+                background: #f8f9fa; 
+                border-left: 4px solid #0066cc;
+                border-radius: 5px; 
+              }
+              code { 
+                background: #e9ecef; 
+                padding: 3px 8px; 
+                border-radius: 3px;
+                font-family: 'Courier New', monospace;
+                font-size: 0.9em;
+              }
+              pre { 
+                background: #2d2d2d; 
+                color: #f8f8f2; 
+                padding: 15px; 
+                border-radius: 5px; 
+                overflow-x: auto;
+                font-size: 0.9em;
+              }
+              a { color: #0066cc; text-decoration: none; }
+              a:hover { text-decoration: underline; }
+              .btn {
+                display: inline-block;
+                padding: 8px 16px;
+                background: #0066cc;
+                color: white;
+                border-radius: 4px;
+                margin-top: 10px;
+              }
+              .btn:hover { background: #0052a3; text-decoration: none; }
+              ol { margin-left: 20px; }
+              li { margin: 8px 0; }
+            </style>
+          </head>
+          <body>
+            <h1>🌐 OpenWrt Package Feed</h1>
+            <p>Custom OpenWrt packages for <strong>mac-shaper</strong> and <strong>luci-app-mac-shaper</strong> built with GitHub Actions.</p>
+            
+            <h2>📦 Available Targets</h2>
+          EOF
+          
+          # Add each target to the main index
+          for target_dir in final-pages/*/; do
+            [ -d "$target_dir" ] || continue
+            target=$(basename "$target_dir")
+            
+            # Count packages
+            pkg_count=$(find "$target_dir" -name "*.ipk" -type f | wc -l)
+            
+            cat >> final-pages/index.html << EOF
+          <div class='target'>
+            <h3>📱 $target</h3>
+            <p><strong>$pkg_count package(s) available</strong></p>
+            <p>Add this feed to your OpenWrt router:</p>
+            <pre>echo 'src/gz custom_feed ${FEED_BASE_URL}/$target' >> /etc/opkg/customfeeds.conf
+          opkg update</pre>
+            <a href='$target/' class='btn'>Browse Packages →</a>
+          </div>
+          EOF
+            
+            # Create index.html for each target directory
+            cat > "$target_dir/index.html" << EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>$target - Package List</title>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+              body { 
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+                max-width: 900px; 
+                margin: 50px auto; 
+                padding: 20px;
+                color: #333;
+              }
+              h1 { color: #0066cc; border-bottom: 3px solid #0066cc; padding-bottom: 10px; }
+              h2 { color: #444; margin-top: 30px; }
+              table { 
+                width: 100%; 
+                border-collapse: collapse;
+                margin: 20px 0;
+                background: white;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+              }
+              th { 
+                background: #0066cc; 
+                color: white; 
+                padding: 12px;
+                text-align: left;
+                font-weight: 600;
+              }
+              td { 
+                padding: 12px; 
+                border-bottom: 1px solid #e9ecef;
+              }
+              tr:hover { background: #f8f9fa; }
+              a { color: #0066cc; text-decoration: none; }
+              a:hover { text-decoration: underline; }
+              .back { margin-bottom: 20px; }
+              .file-icon { margin-right: 8px; }
+              .size { color: #666; }
+              code {
+                background: #e9ecef;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-size: 0.9em;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="back"><a href="../">← Back to all targets</a></div>
+            <h1>📱 $target</h1>
+            <p>Package repository for <strong>$target</strong> architecture.</p>
+            
+            <h2>📦 Available Packages</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>Package</th>
+                  <th>Size</th>
+                </tr>
+              </thead>
+              <tbody>
+          EOF
+            
+            # List all .ipk files
+            for ipk in "$target_dir"/*.ipk; do
+              [ -f "$ipk" ] || continue
+              filename=$(basename "$ipk")
+              size=$(stat -L -c%s "$ipk" 2>/dev/null || echo "0")
+              size_human=$(numfmt --to=iec-i --suffix=B "$size" 2>/dev/null || echo "$size B")
+              
+              echo "<tr>" >> "$target_dir/index.html"
+              echo "  <td><span class='file-icon'>📦</span><a href='$filename'>$filename</a></td>" >> "$target_dir/index.html"
+              echo "  <td class='size'>$size_human</td>" >> "$target_dir/index.html"
+              echo "</tr>" >> "$target_dir/index.html"
+            done
+            
+            cat >> "$target_dir/index.html" << EOF
+              </tbody>
+            </table>
+            
+            <h2>🔧 Installation</h2>
+            <p>To install packages from this feed:</p>
+            <ol>
+              <li>Add the feed to your router (see main page)</li>
+              <li>Run <code>opkg update</code></li>
+              <li>Install with <code>opkg install package-name</code></li>
+            </ol>
+            
+            <h2>📋 Feed Files</h2>
+            <ul>
+              <li><a href="Packages">Packages</a> - Package index (text)</li>
+              <li><a href="Packages.gz">Packages.gz</a> - Package index (compressed)</li>
+            </ul>
+          </body>
+          </html>
+          EOF
+          done
+          
+          # Finish main index
+          cat >> final-pages/index.html << 'EOF'
+            <h2>🔧 Installation Instructions</h2>
+            <ol>
+              <li>SSH into your OpenWrt router</li>
+              <li>Add the feed URL for your architecture (see above)</li>
+              <li>Run <code>opkg update</code></li>
+              <li>Install packages with <code>opkg install mac-shaper</code> or <code>opkg install luci-app-mac-shaper</code></li>
+            </ol>
+            
+            <h2>📚 Package Information</h2>
+            <ul>
+              <li><strong>mac-shaper</strong> - Core MAC address-based traffic shaping utility</li>
+              <li><strong>luci-app-mac-shaper</strong> - LuCI web interface for mac-shaper</li>
+            </ul>
+          </body>
+          </html>
+          EOF
+          
+          echo "✅ Created index pages for all targets"
+
+      - name: Upload final Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: final-pages/
+
+  # Publish the consolidated feed to GitHub Pages
+  deploy:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    needs: prepare-pages
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
